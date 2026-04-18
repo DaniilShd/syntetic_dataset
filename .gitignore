@@ -1,0 +1,72 @@
+# Cache directories
+cache/
+cache/huggingface/
+cache/matplotlib/
+
+# Data directories (игнорируем данные, кроме структуры)
+data/224x224/
+data/defects/
+data/severstal/clean_patches/
+data/severstal/defective_patches/
+data/severstal/defects_visualization_correct/
+data/severstal/test_images/
+data/severstal/train_images/
+
+# Models (обученные модели весят много)
+models/
+*.pth
+*.pt
+*.ckpt
+*.h5
+*.hdf5
+*.onnx
+*.bin
+
+# Results (результаты экспериментов)
+results/
+results/defective_dataset/
+results/final_dataset/
+results/synthetic_backgrounds/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.env
+venv/
+env/
+ENV/
+.venv
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Docker (игнорируем собранные образы, но не Dockerfile)
+docker/*.tar
+docker/*.img
+
+# Logs
+*.log
+logs/
+
+# Configuration with secrets
+configs/*.secret.yaml
+configs/*.local.yaml
+*.key
+*.pem
+
+# Temporary files
+*.tmp
+*.temp
+*.bak

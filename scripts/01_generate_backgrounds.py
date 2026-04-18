@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""
+01_generate_backgrounds.py - Генерация синтетических фонов в Docker
+"""
+
+import sys
+import os
+sys.path.insert(0, '/app/scripts')
+sys.path.insert(0, '/app/src')
+
+import torch
+import random
+import argparse
+from PIL import Image
+from pathlib import Path
+from tqdm import tqdm
+from typing import List, Dict, Optional, Tuple
+
+from diffusers import StableDiffusionImg2ImgPipeline, DDIMScheduler, AutoencoderKL
+
+from config import GenerationConfig
+from utils import (
+    set_seed, load_images_from_dir, save_json, 
+    print_system_info, logger
+)
+
+
+class DockerBackgroundGenerator:
+    """Генератор фонов, оптимизированный для Docker"""
+    
+    def __init__(self, config: GenerationConfig):
+        self.config = config
+        
+        logger.info("🔄 Загрузка Stable Diffusion...")
+        
+        # 🔧 Загрузка улучшенного VAE для устранения фиолетовых артефактов
+        try:
+            vae = AutoencoderKL.from_pretrained(
+                "stabilityai/sd-vae-ft-mse",
+                torch_dtype=torch.float16,
+                cache_dir=config.cache_dir
+            )
+            logger.info("✅ Загружен улучшенный VAE (stabilityai/sd-vae-ft-mse)")
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось загрузить улучшенный VAE: {e}")
+            logger.info("Используется стандартный VAE")
+            vae = None
+        
+        # Использование кеша внутри контейнера
+        self.pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
+            config.model_id,
+            vae=vae,  # 🔧 Подмена VAE
+            torch_dtype=torch.float16,
+            safety_checker=None,
+            requires_safety_checker=False,
+            cache_dir=config.cache_dir,
+            local_files_only=False
+        ).to(config.device)
+        
+        # 🔧 Включение VAE tiling для больших изображений
+        if hasattr(self.pipe.vae, 'enable_tiling'):
+            self.pipe.vae.enable_tiling()
+            logger.info("✅ VAE tiling включен")
+        
+        if config.use_ip_adapter:
+            logger.info("🔄 Загрузка IP-Adapter...")
+            self.pipe.load_ip_adapter(
+                "h94/IP-Adapter",
+                subfolder="models",
+                weight_name="ip-adapter_sd15.bin",
+                cache_dir=config.cache_dir
+            )
+            self.pipe.set_ip_adapter_scale(0.75)
+        
+        # Оптимизации
+        if config.enable_attention_slicing:
+            self.pipe.enable_attention_slicing()
+        
+        if config.enable_xformers:
+            try:
+                self.pipe.enable_xformers_memory_efficient_attention()
+                logger.info("✅ xformers включен")
+            except:
+                logger.warning("⚠️ xformers не удалось включить")
+        
+        self.pipe.scheduler = DDIMScheduler.from_config(self.pipe.scheduler.config)
+        
+        torch.cuda.empty_cache()
+        logger.info("✅ Генератор готов")
+    
+    def generate_one(
+        self,
+        reference_image: Image.Image,
+        seed: Optional[int] = None
+    ) -> Tuple[Image.Image, Dict]:
+        """Генерация одного синтетического фона"""
+        
+        if seed is None:
+            seed = random.randint(0, 2**32 - 1)
+        
+        ip_scale = random.uniform(
+            self.config.ip_adapter_scale_min,
+            self.config.ip_adapter_scale_max
+        )
+        strength = random.uniform(
+            self.config.strength_min,
+            self.config.strength_max
+        )
+        
+        generator = torch.Generator(device=self.config.device).manual_seed(seed)
+        
+        # 🔧 Усиленный negative_prompt против фиолетовых артефактов
+        negative_prompt = (
+            "purple, violet, magenta, purple dots, purple artifacts, "
+            "color noise, chromatic aberration, digital noise, "
+            "low quality, blurry, distorted, watermark, text"
+        )
+        
+        if self.config.use_ip_adapter:
+            output = self.pipe(
+                prompt=self.config.prompt,
+                negative_prompt=negative_prompt,
+                image=reference_image,
+                strength=strength,
+                guidance_scale=self.config.guidance_scale,
+                num_inference_steps=self.config.num_inference_steps,
+                generator=generator,
+                ip_adapter_image=reference_image,
+                ip_adapter_scale=ip_scale
+            )
+        else:
+            output = self.pipe(
+                prompt=self.config.prompt,
+                negative_prompt=negative_prompt,
+                image=reference_image,
+                strength=strength,
+                guidance_scale=self.config.guidance_scale,
+                num_inference_steps=self.config.num_inference_steps,
+                generator=generator
+            )
+        
+        # Извлечение изображения
+        if hasattr(output, 'images'):
+            image = output.images[0]
+        elif isinstance(output, tuple):
+            image = output[0]
+            if isinstance(image, list):
+                image = image[0]
+        else:
+            image = output
+        
+        metadata = {
+            "seed": seed,
+            "strength": round(strength, 3),
+            "guidance_scale": self.config.guidance_scale,
+            "steps": self.config.num_inference_steps
+        }
+        
+        if self.config.use_ip_adapter:
+            metadata["ip_adapter_scale"] = round(ip_scale, 3)
+        
+        if random.random() < 0.05:
+            torch.cuda.empty_cache()
+        
+        return image, metadata
+    
+    def generate_batch(
+        self,
+        reference_paths: List[Path],
+        output_dir: Path,
+        variants_per_reference: int,
+        total_limit: Optional[int] = None
+    ) -> List[Dict]:
+        """Массовая генерация фонов"""
+        
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        total_generated = 0
+        all_metadata = []
+        
+        for ref_idx, ref_path in enumerate(reference_paths):
+            logger.info(f"📁 Референс {ref_idx+1}/{len(reference_paths)}: {ref_path.name}")
+            
+            ref_image = Image.open(ref_path).convert("RGB")
+            
+            for variant in range(variants_per_reference):
+                if total_limit and total_generated >= total_limit:
+                    logger.info(f"✅ Лимит {total_limit} достигнут")
+                    return all_metadata
+                
+                try:
+                    syn_image, meta = self.generate_one(ref_image)
+                    
+                    if syn_image is None:
+                        logger.error(f"Пустое изображение для варианта {variant}")
+                        continue
+                    
+                    if not hasattr(syn_image, 'save'):
+                        logger.error(f"Объект не является изображением: {type(syn_image)}")
+                        continue
+                    
+                    filename = f"bg_{total_generated:06d}_ref{ref_idx:03d}_v{variant:03d}.png"
+                    syn_image.save(output_dir / filename, "PNG")
+                    
+                    meta.update({
+                        "filename": filename,
+                        "reference_image": str(ref_path.name),
+                        "reference_index": ref_idx,
+                        "variant": variant
+                    })
+                    all_metadata.append(meta)
+                    
+                    total_generated += 1
+                    
+                    if total_generated % 10 == 0:
+                        logger.info(f"   📊 Сгенерировано: {total_generated}")
+                        
+                except Exception as e:
+                    logger.error(f"Ошибка при генерации варианта {variant}: {e}")
+                    torch.cuda.empty_cache()
+                    continue
+        
+        save_json(all_metadata, output_dir / "metadata.json")
+        logger.info(f"🎉 Сгенерировано {total_generated} фонов")
+        
+        return all_metadata
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Генерация синтетических фонов в Docker")
+    parser.add_argument("--clean_dir", type=str, default="data/severstal/clean_patches")
+    parser.add_argument("--output_dir", type=str, default="/app/results/synthetic_backgrounds")
+    parser.add_argument("--variants", type=int, default=1)
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--strength_min", type=float, default=0.35)
+    parser.add_argument("--strength_max", type=float, default=0.45)
+    parser.add_argument("--ip_scale_min", type=float, default=0.70)
+    parser.add_argument("--ip_scale_max", type=float, default=0.80)
+    parser.add_argument("--guidance_scale", type=float, default=5.0)  # 🔧 Уменьшено для снижения артефактов
+    parser.add_argument("--steps", type=int, default=40)  # 🔧 Увеличено для качества
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--no_ip_adapter", action="store_true")
+    
+    args = parser.parse_args()
+    
+    print_system_info()
+    set_seed(args.seed)
+    
+    config = GenerationConfig(
+        ip_adapter_scale_min=args.ip_scale_min,
+        ip_adapter_scale_max=args.ip_scale_max,
+        strength_min=args.strength_min,
+        strength_max=args.strength_max,
+        guidance_scale=args.guidance_scale,
+        num_inference_steps=args.steps,
+        use_ip_adapter=not args.no_ip_adapter
+    )
+    
+    logger.info("=" * 60)
+    logger.info("🎨 ГЕНЕРАЦИЯ СИНТЕТИЧЕСКИХ ФОНОВ")
+    logger.info("=" * 60)
+    logger.info(f"IP-Adapter: {'включен' if config.use_ip_adapter else 'выключен'}")
+    if config.use_ip_adapter:
+        logger.info(f"IP-Adapter scale: {config.ip_adapter_scale_min}-{config.ip_adapter_scale_max}")
+    logger.info(f"Strength: {config.strength_min}-{config.strength_max}")
+    logger.info(f"Guidance scale: {config.guidance_scale}")
+    logger.info(f"Inference steps: {config.num_inference_steps}")
+    
+    references = load_images_from_dir(args.clean_dir)
+    
+    if not references:
+        logger.error(f"Нет изображений в {args.clean_dir}")
+        sys.exit(1)
+    
+    generator = DockerBackgroundGenerator(config)
+    generator.generate_batch(
+        reference_paths=references,
+        output_dir=Path(args.output_dir),
+        variants_per_reference=args.variants,
+        total_limit=args.limit
+    )
+    
+    logger.info("✅ Генерация завершена")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,39 @@
+services:
+  synthetic:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: synthetic_generator_v2
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_HOME=/app/cache/huggingface
+      - HUGGINGFACE_HUB_CACHE=/app/cache/huggingface
+      - TRANSFORMERS_CACHE=/app/cache/huggingface
+      - TORCH_HOME=/app/cache/torch
+      - CUDA_VISIBLE_DEVICES=0
+      # Оптимизация под RTX 5070 Ti
+      - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+      - OMP_NUM_THREADS=8
+    volumes:
+      - ./models:/app/models          # чекпойнты LoRA
+      - ./data:/app/data              # входные реальные изображения
+      - ./results:/app/results        # выходная синтетика
+      - ./scripts:/app/scripts        # скрипты генерации
+      - ./src:/app/src
+      - ./configs:/app/configs
+      - ./cache:/app/cache            # кеш HF и torch
+    shm_size: 16g                     # важно для DataLoader
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    working_dir: /app
+    stdin_open: true
+    tty: true
