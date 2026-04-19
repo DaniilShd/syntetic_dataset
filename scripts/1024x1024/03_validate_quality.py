@@ -322,9 +322,9 @@ def plot_histogram_comparison(real_dir: str, fake_dir: str, output_path: str):
 
 def main():
     parser = argparse.ArgumentParser(description="Полная валидация качества генерации")
-    parser.add_argument("--real_dir", type=str, required=True, help="Реальные текстуры")
-    parser.add_argument("--fake_dir", type=str, required=True, help="Синтетические фоны")
-    parser.add_argument("--output", type=str, default="./output/validation")
+    parser.add_argument("--real_dir", type=str, default="./data/severstal/defective_patches/images", help="Реальные текстуры")
+    parser.add_argument("--fake_dir", type=str, default="./results/defective_dataset/images",  help="Синтетические фоны")
+    parser.add_argument("--output", type=str, default="./results/validation")
     parser.add_argument("--skip_bias", action="store_true", help="Пропустить проверку bias")
     
     args = parser.parse_args()
