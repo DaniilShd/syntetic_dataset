@@ -224,8 +224,8 @@ def extract_defective_patches_yolo(
     output_path = Path(output_dir)
     
     # СОЗДАЕМ ПАПКИ ТОЛЬКО ДЛЯ TRAIN
-    train_images_path = output_path / "images" / "train"
-    train_labels_path = output_path / "labels" / "train"
+    train_images_path = output_path / "images"
+    train_labels_path = output_path / "labels"
     
     for path in [train_images_path, train_labels_path]:
         path.mkdir(parents=True, exist_ok=True)
@@ -532,8 +532,6 @@ if __name__ == "__main__":
         print(f"📍 Все патчи в train (без val)")
         print(f"\n📋 dataset.yaml:")
         print(f"   path: ./data/256_yolo/defect_patches")
-        print(f"   train: images/train")
-        print(f"   val: images/train")
         print(f"   nc: 4")
         print(f"   names: ['defect_type_1', 'defect_type_2', 'defect_type_3', 'defect_type_4']")
     else:

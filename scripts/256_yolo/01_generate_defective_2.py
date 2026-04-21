@@ -2,6 +2,7 @@
 """
 03_generate_defective.py - Генерация синтетических изображений с дефектами
 Поддержка YOLO-разметки с автоматической трансформацией bbox
+Включает спектральный контроль для сохранения текстуры
 """
 
 import sys
@@ -24,16 +25,24 @@ from diffusers import StableDiffusionImg2ImgPipeline, DDIMScheduler, Autoencoder
 from config import GenerationConfig
 from utils import set_seed, print_system_info, logger
 
+
 def match_spectrum(source: Image.Image, target: Image.Image) -> Image.Image:
+    """
+    Приведение спектра сгенерированного изображения к спектру референса
+    Сохраняет частотное распределение оригинала при новой структуре (фазе)
+    """
     src = np.array(source).astype(np.float32)
     tgt = np.array(target).astype(np.float32)
 
+    # FFT по пространственным осям
     src_f = np.fft.fft2(src, axes=(0, 1))
     tgt_f = np.fft.fft2(tgt, axes=(0, 1))
 
-    src_phase = np.angle(src_f)
-    tgt_amp = np.abs(tgt_f)
+    # Извлекаем амплитуду и фазу
+    src_phase = np.angle(src_f)  # Фаза от сгенерированного (новая структура)
+    tgt_amp = np.abs(tgt_f)      # Амплитуда от референса (частотный состав)
 
+    # Комбинируем: амплитуда референса + фаза генерации
     result_f = tgt_amp * np.exp(1j * src_phase)
     result = np.fft.ifft2(result_f, axes=(0, 1)).real
 
@@ -41,17 +50,23 @@ def match_spectrum(source: Image.Image, target: Image.Image) -> Image.Image:
     return Image.fromarray(result)
 
 
-def inject_high_freq(source: Image.Image, target: Image.Image, alpha: float = 0.25) -> Image.Image:
+def inject_high_freq(source: Image.Image, target: Image.Image, alpha: float = 0.3) -> Image.Image:
+    """
+    Инжекция высокочастотной составляющей из референса
+    Добавляет микротекстуру и детализацию
+    """
     src = np.array(source).astype(np.float32)
     tgt = np.array(target).astype(np.float32)
 
+    # High-pass фильтр через гауссово размытие
     blur = cv2.GaussianBlur(tgt, (0, 0), sigmaX=3)
-    high = tgt - blur
+    high = tgt - blur  # Высокочастотная компонента
 
     result = src + alpha * high
     result = np.clip(result, 0, 255).astype(np.uint8)
 
     return Image.fromarray(result)
+
 
 class YOLODatasetHandler:
     """Обработчик YOLO-разметки"""
@@ -91,7 +106,8 @@ class YOLODatasetHandler:
                 f.write(f"{ann['class']} {ann['x_center']:.6f} {ann['y_center']:.6f} "
                        f"{ann['width']:.6f} {ann['height']:.6f}\n")
     
-    def flip_annotation_horizontal(self, annotations: List[Dict]) -> List[Dict]:
+    @staticmethod
+    def flip_annotation_horizontal(annotations: List[Dict]) -> List[Dict]:
         """Горизонтальное отражение bbox (меняется только x_center)"""
         flipped = []
         for ann in annotations:
@@ -106,13 +122,13 @@ class YOLODatasetHandler:
 
 
 class DefectiveGenerator:
-    """Генератор изображений с дефектами через img2img"""
+    """Генератор изображений с дефектами через img2img со спектральным контролем"""
     
     def __init__(self, config: GenerationConfig):
         self.config = config
-        self.use_spectrum_matching = True
-        self.use_high_freq = True
-        self.high_freq_alpha = 0.25
+        self.use_spectrum_matching = config.use_spectrum_matching
+        self.use_high_freq_injection = config.use_high_freq_injection
+        self.high_freq_alpha = config.high_freq_alpha
         
         logger.info("🔄 Загрузка Stable Diffusion...")
         
@@ -123,8 +139,9 @@ class DefectiveGenerator:
                 torch_dtype=torch.float16,
                 cache_dir=config.cache_dir
             )
-            logger.info("✅ Загружен улучшенный VAE")
-        except:
+            logger.info("✅ Загружен улучшенный VAE (MSE)")
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось загрузить MSE VAE: {e}")
             vae = None
             logger.info("ℹ️ Используется стандартный VAE")
         
@@ -141,29 +158,53 @@ class DefectiveGenerator:
         # Оптимизации
         if hasattr(self.pipe.vae, 'enable_tiling'):
             self.pipe.vae.enable_tiling()
+            logger.info("✅ Tiling VAE включен")
         
         if config.use_ip_adapter:
             logger.info("🔄 Загрузка IP-Adapter...")
-            self.pipe.load_ip_adapter(
-                "h94/IP-Adapter",
-                subfolder="models",
-                weight_name="ip-adapter_sd15.bin",
-                cache_dir=config.cache_dir
-            )
-            self.pipe.set_ip_adapter_scale(0.75)
+            try:
+                self.pipe.load_ip_adapter(
+                    "h94/IP-Adapter",
+                    subfolder="models",
+                    weight_name="ip-adapter_sd15.bin",
+                    cache_dir=config.cache_dir
+                )
+                self.pipe.set_ip_adapter_scale(config.ip_adapter_scale_default)
+                logger.info(f"✅ IP-Adapter загружен (scale={config.ip_adapter_scale_default})")
+            except Exception as e:
+                logger.warning(f"⚠️ Не удалось загрузить IP-Adapter: {e}")
+                config.use_ip_adapter = False
         
         if config.enable_attention_slicing:
             self.pipe.enable_attention_slicing()
+            logger.info("✅ Attention slicing включен")
         
         if config.enable_xformers:
             try:
                 self.pipe.enable_xformers_memory_efficient_attention()
-            except:
+                logger.info("✅ xFormers включен")
+            except Exception as e:
+                logger.warning(f"⚠️ xFormers не доступен: {e}")
                 pass
         
+        # DDIM scheduler для лучшего контроля
         self.pipe.scheduler = DDIMScheduler.from_config(self.pipe.scheduler.config)
+        logger.info("✅ Используется DDIM scheduler")
+        
         torch.cuda.empty_cache()
-        logger.info("✅ Генератор готов")
+        logger.info("🚀 Генератор готов")
+        
+        # Логирование настроек
+        logger.info("=" * 50)
+        logger.info("Настройки генерации:")
+        logger.info(f"  Strength: {config.strength_min:.2f}-{config.strength_max:.2f}")
+        logger.info(f"  Guidance scale: {config.guidance_scale}")
+        logger.info(f"  Steps: {config.num_inference_steps}")
+        logger.info(f"  Spectrum matching: {self.use_spectrum_matching}")
+        logger.info(f"  High-freq injection: {self.use_high_freq_injection}")
+        if self.use_high_freq_injection:
+            logger.info(f"    Alpha: {self.high_freq_alpha}")
+        logger.info("=" * 50)
     
     def generate_one(
         self,
@@ -184,7 +225,7 @@ class DefectiveGenerator:
         if self.config.use_ip_adapter:
             output = self.pipe(
                 prompt=self.config.prompt,
-                negative_prompt="blurry, low quality, distorted, text, watermark",
+                negative_prompt="blurry, low quality, distorted, text, watermark, cartoon, painting",
                 image=reference_image,
                 strength=strength,
                 guidance_scale=self.config.guidance_scale,
@@ -196,7 +237,7 @@ class DefectiveGenerator:
         else:
             output = self.pipe(
                 prompt=self.config.prompt,
-                negative_prompt="blurry, low quality, distorted, text, watermark",
+                negative_prompt="blurry, low quality, distorted, text, watermark, cartoon, painting",
                 image=reference_image,
                 strength=strength,
                 guidance_scale=self.config.guidance_scale,
@@ -209,10 +250,24 @@ class DefectiveGenerator:
         if isinstance(image, list):
             image = image[0]
         
+        # ===== СПЕКТРАЛЬНЫЙ КОНТРОЛЬ =====
+        if self.use_spectrum_matching:
+            image = match_spectrum(image, reference_image)
+        
+        # ===== ИНЖЕКЦИЯ ВЫСОКИХ ЧАСТОТ =====
+        if self.use_high_freq_injection:
+            image = inject_high_freq(
+                image,
+                reference_image,
+                alpha=self.high_freq_alpha
+            )
+        
         return image, {
             "seed": seed,
             "strength": round(strength, 3),
-            "ip_adapter_scale": round(ip_scale, 3) if self.config.use_ip_adapter else None
+            "ip_adapter_scale": round(ip_scale, 3) if self.config.use_ip_adapter else None,
+            "spectrum_matched": self.use_spectrum_matching,
+            "high_freq_injected": self.use_high_freq_injection
         }
     
     def apply_augmentations(
@@ -222,12 +277,15 @@ class DefectiveGenerator:
     ) -> Tuple[Image.Image, List[Dict], bool]:
         """Применение аугментаций с обновлением разметки"""
         
+        if not self.config.enable_augmentation:
+            return image, annotations, False
+        
         flipped_h = False
         
         # Горизонтальный флип
         if random.random() < self.config.aug_flip_prob:
             image = image.transpose(Image.FLIP_LEFT_RIGHT)
-            annotations = YOLODatasetHandler.flip_annotation_horizontal(None, annotations)
+            annotations = YOLODatasetHandler.flip_annotation_horizontal(annotations)
             flipped_h = True
         
         # Яркость
@@ -265,7 +323,9 @@ class DefectiveGenerator:
         target_handler = YOLODatasetHandler(output_images, output_labels)
         
         # Поиск изображений
-        image_paths = list(input_images_dir.glob("*.png")) + list(input_images_dir.glob("*.jpg"))
+        image_paths = list(input_images_dir.glob("*.png")) + \
+                     list(input_images_dir.glob("*.jpg")) + \
+                     list(input_images_dir.glob("*.jpeg"))
         
         if not image_paths:
             logger.error(f"Нет изображений в {input_images_dir}")
@@ -281,7 +341,12 @@ class DefectiveGenerator:
                 break
             
             # Загрузка исходных данных
-            ref_image = Image.open(img_path).convert("RGB")
+            try:
+                ref_image = Image.open(img_path).convert("RGB")
+            except Exception as e:
+                logger.error(f"❌ Ошибка загрузки {img_path.name}: {e}")
+                continue
+            
             annotations = source_handler.load_annotation(img_path.name)
             
             if not annotations:
@@ -290,10 +355,13 @@ class DefectiveGenerator:
             
             # Ресайз если нужно
             if self.config.resize_to and ref_image.size != (self.config.resize_to, self.config.resize_to):
+                # Сохраняем пропорции для аннотаций
+                old_w, old_h = ref_image.size
                 ref_image = ref_image.resize(
                     (self.config.resize_to, self.config.resize_to),
                     Image.Resampling.LANCZOS
                 )
+                # Аннотации уже нормализованы, не требуют изменения
             
             # Генерация вариантов
             for variant in range(variants_per_image):
@@ -303,18 +371,6 @@ class DefectiveGenerator:
                 try:
                     # Генерация синтетического изображения
                     syn_image, meta = self.generate_one(ref_image)
-
-                    # ===== SPECTRUM MATCHING =====
-                    if self.use_spectrum_matching:
-                        syn_image = match_spectrum(syn_image, ref_image)
-
-                    # ===== HIGH FREQUENCY INJECTION =====
-                    if self.use_high_freq:
-                        syn_image = inject_high_freq(
-                            syn_image,
-                            ref_image,
-                            alpha=self.high_freq_alpha
-    )
                     
                     # Аугментация с обновлением разметки
                     current_annotations = [ann.copy() for ann in annotations]
@@ -324,7 +380,7 @@ class DefectiveGenerator:
                     
                     # Сохранение
                     filename = f"syn_{total_generated:06d}_{img_path.stem}_v{variant}.png"
-                    syn_image.save(output_images / filename, "PNG")
+                    syn_image.save(output_images / filename, "PNG", optimize=True)
                     target_handler.save_annotation(filename, current_annotations)
                     
                     # Метаданные
@@ -339,16 +395,16 @@ class DefectiveGenerator:
                     
                     total_generated += 1
                     
-                    if total_generated % 50 == 0:
+                    if total_generated % 10 == 0:
                         logger.info(f"📊 Сгенерировано: {total_generated}")
                         
                 except Exception as e:
-                    logger.error(f"❌ Ошибка: {e}")
+                    logger.error(f"❌ Ошибка генерации варианта {variant} для {img_path.name}: {e}")
                     torch.cuda.empty_cache()
                     continue
             
             # Очистка памяти
-            if total_generated % 10 == 0:
+            if total_generated % 5 == 0:
                 torch.cuda.empty_cache()
         
         # Сохранение метаданных
@@ -357,11 +413,18 @@ class DefectiveGenerator:
             json.dump(all_metadata, f, indent=2)
         
         logger.info(f"🎉 Генерация завершена. Создано {total_generated} изображений с разметкой")
+        logger.info(f"📁 Результаты сохранены в {output_dir}")
+        
+        # Статистика
+        if all_metadata:
+            avg_strength = np.mean([m['strength'] for m in all_metadata])
+            logger.info(f"📊 Средняя сила преобразования: {avg_strength:.3f}")
+        
         return all_metadata
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Генерация синтетических изображений с YOLO-разметкой")
+    parser = argparse.ArgumentParser(description="Генерация синтетических изображений с YOLO-разметкой и спектральным контролем")
     
     # Основные пути
     parser.add_argument("--input_dir", type=str, default="data/256_yolo/balanced_defect_patches/train",
@@ -369,22 +432,30 @@ def main():
     parser.add_argument("--output_dir", type=str, default="data/dataset_synthetic/defect_patches",
                        help="Выходная директория")
     
-    # Параметры генерации
-    parser.add_argument("--variants", type=int, default=1,
+    # Параметры генерации (ОПТИМИЗИРОВАНЫ для сохранения текстуры)
+    parser.add_argument("--variants", type=int, default=5,
                        help="Количество синтетических вариантов на одно изображение")
     parser.add_argument("--limit", type=int, default=None,
                        help="Общий лимит генерируемых изображений")
-    parser.add_argument("--strength_min", type=float, default=0.35,
-                       help="Минимальная сила преобразования")
-    parser.add_argument("--strength_max", type=float, default=0.45,
-                       help="Максимальная сила преобразования")
-    parser.add_argument("--guidance_scale", type=float, default=5.0,
-                       help="Сила следования промпту")
-    parser.add_argument("--steps", type=int, default=30,
-                       help="Количество шагов денойзинга")
+    parser.add_argument("--strength_min", type=float, default=0.15,
+                       help="Минимальная сила преобразования (меньше = больше сохранения структуры)")
+    parser.add_argument("--strength_max", type=float, default=0.25,
+                       help="Максимальная сила преобразования (рекомендуется 0.15-0.25)")
+    parser.add_argument("--guidance_scale", type=float, default=3.0,
+                       help="Сила следования промпту (меньше = меньше галлюцинаций)")
+    parser.add_argument("--steps", type=int, default=20,
+                       help="Количество шагов денойзинга (меньше = меньше сглаживания)")
     parser.add_argument("--prompt", type=str, 
-                       default="steel surface with manufacturing defects, industrial photography",
+                       default="industrial steel surface with manufacturing texture, detailed metallic structure",
                        help="Промпт для генерации")
+    
+    # Спектральный контроль (НОВЫЕ ПАРАМЕТРЫ)
+    parser.add_argument("--no_spectrum_matching", action="store_true",
+                       help="Отключить спектральное согласование (FFT matching)")
+    parser.add_argument("--no_high_freq", action="store_true",
+                       help="Отключить инжекцию высоких частот")
+    parser.add_argument("--high_freq_alpha", type=float, default=0.3,
+                       help="Сила инжекции высоких частот (0.2-0.4 рекомендуется)")
     
     # Аугментация
     parser.add_argument("--no_augmentation", action="store_true",
@@ -397,7 +468,7 @@ def main():
                        help="Диапазон изменения яркости")
     
     # Технические параметры
-    parser.add_argument("--resize_to", type=int, default=1024,
+    parser.add_argument("--resize_to", type=int, default=256,
                        help="Размер изображения (квадрат)")
     parser.add_argument("--seed", type=int, default=42,
                        help="Сид для воспроизводимости")
@@ -419,8 +490,10 @@ def main():
         logger.error(f"Директории images/ и labels/ не найдены в {input_path}")
         sys.exit(1)
     
-    # Конфигурация
+    # Конфигурация с новыми параметрами
     config = GenerationConfig()
+    
+    # Основные параметры генерации (оптимизированы)
     config.strength_min = args.strength_min
     config.strength_max = args.strength_max
     config.guidance_scale = args.guidance_scale
@@ -428,21 +501,42 @@ def main():
     config.use_ip_adapter = not args.no_ip_adapter
     config.prompt = args.prompt
     config.resize_to = args.resize_to
+    
+    # Спектральный контроль (НОВОЕ)
+    config.use_spectrum_matching = not args.no_spectrum_matching
+    config.use_high_freq_injection = not args.no_high_freq
+    config.high_freq_alpha = args.high_freq_alpha
+    
+    # Аугментация
     config.enable_augmentation = not args.no_augmentation
     config.aug_flip_prob = args.flip_prob
     config.aug_brightness_prob = args.brightness_prob
     config.aug_brightness_min = args.brightness_range[0]
     config.aug_brightness_max = args.brightness_range[1]
     
-    logger.info("=" * 60)
-    logger.info("🎨 ГЕНЕРАЦИЯ СИНТЕТИЧЕСКИХ ДЕФЕКТОВ С YOLO-РАЗМЕТКОЙ")
-    logger.info("=" * 60)
-    logger.info(f"Входная директория: {input_path}")
-    logger.info(f"Выходная директория: {args.output_dir}")
-    logger.info(f"Вариантов на изображение: {args.variants}")
-    logger.info(f"Strength: {config.strength_min}-{config.strength_max}")
-    logger.info(f"Горизонтальный флип: {config.aug_flip_prob}")
-    logger.info("=" * 60)
+    # Дополнительные параметры
+    config.ip_adapter_scale_default = 0.75
+    config.ip_adapter_scale_min = 0.6
+    config.ip_adapter_scale_max = 0.85
+    config.aug_contrast_prob = 0.2
+    config.aug_contrast_min = 0.8
+    config.aug_contrast_max = 1.2
+    
+    logger.info("=" * 70)
+    logger.info("🎨 ГЕНЕРАЦИЯ СИНТЕТИЧЕСКИХ ДЕФЕКТОВ СО СПЕКТРАЛЬНЫМ КОНТРОЛЕМ")
+    logger.info("=" * 70)
+    logger.info(f"📂 Вход: {input_path}")
+    logger.info(f"📂 Выход: {args.output_dir}")
+    logger.info(f"🔢 Вариантов на изображение: {args.variants}")
+    logger.info(f"⚙️  Strength: {config.strength_min:.2f}-{config.strength_max:.2f} (оптимизировано)")
+    logger.info(f"🎯 Guidance scale: {config.guidance_scale} (снижено)")
+    logger.info(f"🔄 Steps: {config.num_inference_steps} (оптимально)")
+    logger.info(f"📊 Spectrum matching: {'✅ ВКЛ' if config.use_spectrum_matching else '❌ ВЫКЛ'}")
+    logger.info(f"🔍 High-freq injection: {'✅ ВКЛ' if config.use_high_freq_injection else '❌ ВЫКЛ'}")
+    if config.use_high_freq_injection:
+        logger.info(f"   Alpha: {config.high_freq_alpha}")
+    logger.info(f"🖼️  IP-Adapter: {'✅ ВКЛ' if config.use_ip_adapter else '❌ ВЫКЛ'}")
+    logger.info("=" * 70)
     
     # Запуск генерации
     generator = DefectiveGenerator(config)
@@ -454,7 +548,7 @@ def main():
         total_limit=args.limit
     )
     
-    logger.info("✅ Процесс завершен")
+    logger.info("✅ Процесс завершен успешно")
 
 
 if __name__ == "__main__":

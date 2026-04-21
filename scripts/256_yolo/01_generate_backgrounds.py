@@ -11,7 +11,7 @@ sys.path.insert(0, '/app/src')
 import torch
 import random
 import argparse
-from PIL import Image
+from PIL import Image, ImageEnhance
 from pathlib import Path
 from tqdm import tqdm
 from typing import List, Dict, Optional, Tuple
@@ -28,6 +28,15 @@ class BackgroundGenerator:
     # Размеры для обработки
     GENERATION_SIZE = (1024, 1024)  # для Stable Diffusion
     OUTPUT_SIZE = (640, 640)        # финальный размер
+    
+    # Параметры аугментации
+    AUG_FLIP_PROB = 0.5
+    AUG_BRIGHTNESS_PROB = 0.3
+    AUG_BRIGHTNESS_MIN = 0.9
+    AUG_BRIGHTNESS_MAX = 1.1
+    AUG_CONTRAST_PROB = 0.3
+    AUG_CONTRAST_MIN = 0.9
+    AUG_CONTRAST_MAX = 1.1
     
     def __init__(self, config: GenerationConfig):
         self.config = config
@@ -104,6 +113,27 @@ class BackgroundGenerator:
         """Ресайз результата до 640x640"""
         return image.resize(self.OUTPUT_SIZE, Image.Resampling.LANCZOS)
     
+    def _augment_image(self, image: Image.Image) -> Image.Image:
+        """Аугментация изображения"""
+        
+        # Горизонтальный флип
+        if random.random() < self.AUG_FLIP_PROB:
+            image = image.transpose(Image.FLIP_LEFT_RIGHT)
+        
+        # Яркость
+        if random.random() < self.AUG_BRIGHTNESS_PROB:
+            enhancer = ImageEnhance.Brightness(image)
+            factor = random.uniform(self.AUG_BRIGHTNESS_MIN, self.AUG_BRIGHTNESS_MAX)
+            image = enhancer.enhance(factor)
+        
+        # Контраст
+        if random.random() < self.AUG_CONTRAST_PROB:
+            enhancer = ImageEnhance.Contrast(image)
+            factor = random.uniform(self.AUG_CONTRAST_MIN, self.AUG_CONTRAST_MAX)
+            image = enhancer.enhance(factor)
+        
+        return image
+    
     def generate(self, reference: Image.Image, seed: int = None) -> Tuple[Image.Image, Dict]:
         """Генерация одного фона"""
         
@@ -149,6 +179,9 @@ class BackgroundGenerator:
         # Ресайз до 640x640
         result_640 = self._resize_output(result)
         
+        # Аугментация
+        result_640 = self._augment_image(result_640)
+        
         # Метаданные
         metadata = {
             "seed": seed,
@@ -156,7 +189,8 @@ class BackgroundGenerator:
             "guidance_scale": self.config.guidance_scale,
             "steps": self.config.num_inference_steps,
             "input_size": self.GENERATION_SIZE,
-            "output_size": self.OUTPUT_SIZE
+            "output_size": self.OUTPUT_SIZE,
+            "augmented": True
         }
         
         if self.config.use_ip_adapter:
@@ -229,7 +263,7 @@ def main():
     parser = argparse.ArgumentParser(description="Генерация синтетических фонов")
     
     # Основные параметры
-    parser.add_argument("--input_dir", default="data/256_yolo/balanced_clean_patches", help="Директория с изображениями 256x256")
+    parser.add_argument("--input_dir", default="data/256_yolo/balanced_clean_patches/train", help="Директория с изображениями 256x256")
     parser.add_argument("--output_dir", default="data/dataset_synthetic/clean_patches", help="Куда сохранять результат 640x640")
     parser.add_argument("--variants", type=int, default=5, help="Вариантов на одно изображение")
     parser.add_argument("--limit", type=int, default=None, help="Общий лимит генерации")
@@ -257,12 +291,13 @@ def main():
     )
     
     logger.info("=" * 60)
-    logger.info("🎨 ГЕНЕРАЦИЯ ФОНОВ (256 -> 1024 -> 640)")
+    logger.info("🎨 ГЕНЕРАЦИЯ ФОНОВ (256 -> 1024 -> 640 + АУГМЕНТАЦИЯ)")
     logger.info("=" * 60)
     logger.info(f"Вход: {args.input_dir} (256x256)")
     logger.info(f"Выход: {args.output_dir} (640x640)")
     logger.info(f"Промежуточный размер: 1024x1024")
     logger.info(f"IP-Adapter: {'вкл' if config.use_ip_adapter else 'выкл'}")
+    logger.info(f"Аугментация: флип(0.5), яркость(0.3, 0.9-1.1), контраст(0.3, 0.9-1.1)")
     
     # Загрузка изображений
     references = load_images_from_dir(args.input_dir)

@@ -29,6 +29,7 @@ class GenerationConfig:
     # Ключевые параметры для Severstal
     ip_adapter_scale_min: float = 0.70
     ip_adapter_scale_max: float = 0.80
+    ip_adapter_scale_default: float = 0.75  # ← ДОБАВЛЕНО (базовое значение)
     strength_min: float = 0.15
     strength_max: float = 0.22
     guidance_scale: float = 2.0
@@ -36,6 +37,22 @@ class GenerationConfig:
     
     # Размеры
     resolution: int = 1024
+    resize_to: Optional[int] = None  # Для ресайза в defective генераторе
+    
+    # ===== СПЕКТРАЛЬНЫЙ КОНТРОЛЬ (НОВОЕ) =====
+    use_spectrum_matching: bool = True      # ← ДОБАВЛЕНО (FFT matching)
+    use_high_freq_injection: bool = True    # ← ДОБАВЛЕНО (инжекция высоких частот)
+    high_freq_alpha: float = 0.3            # ← ДОБАВЛЕНО (сила инжекции)
+    
+    # Аугментация
+    enable_augmentation: bool = True
+    aug_flip_prob: float = 0.5
+    aug_brightness_prob: float = 0.3
+    aug_brightness_min: float = 0.8
+    aug_brightness_max: float = 1.2
+    aug_contrast_prob: float = 0.3          # ← ДОБАВЛЕНО
+    aug_contrast_min: float = 0.8           # ← ДОБАВЛЕНО
+    aug_contrast_max: float = 1.2           # ← ДОБАВЛЕНО
     
     # Оптимизации
     enable_attention_slicing: bool = True
