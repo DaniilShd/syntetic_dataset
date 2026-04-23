@@ -62,13 +62,13 @@ def draw_yolo_bbox(image_path: Path, label_path: Path, output_path: Path = None)
 
 def main():
     parser = argparse.ArgumentParser(description="Визуализация YOLO bbox")
-    parser.add_argument("--images", type=str, default="data/dataset_synthetic/defect_patches/images",
+    parser.add_argument("--images", type=str, default="data/synthetic_adaptive_real/images",
                        help="Путь к изображениям")
-    parser.add_argument("--labels", type=str, default="data/dataset_synthetic/defect_patches/labels",
+    parser.add_argument("--labels", type=str, default="data/synthetic_adaptive_real/labels",
                        help="Путь к разметке")
-    parser.add_argument("--output", type=str, default="data/dataset_synthetic/defect_patches/visualized",
+    parser.add_argument("--output", type=str, default="data/synthetic_adaptive_real/visualized",
                        help="Выходная директория")
-    parser.add_argument("--samples", type=int, default=30,
+    parser.add_argument("--samples", type=int, default=200,
                        help="Количество случайных примеров (0 = все)")
     parser.add_argument("--show", action="store_true",
                        help="Показать изображения")

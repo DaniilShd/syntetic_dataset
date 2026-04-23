@@ -390,12 +390,12 @@ class AdaptiveDefectComposer:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--clean_dir", type=str, default="data/dataset_synthetic/clean_patches")
+    parser.add_argument("--clean_dir", type=str, default="data/256_yolo/balanced_clean_patches/train")
     parser.add_argument("--severstal_images", type=str, default="data/severstal/train_images")
     parser.add_argument("--severstal_csv", type=str, default="data/severstal/train.csv")
-    parser.add_argument("--output_dir", type=str, default="data/synthetic_adaptive")
-    parser.add_argument("--num_images", type=int, default=10000)
-    parser.add_argument("--similarity", type=float, default=0.4, 
+    parser.add_argument("--output_dir", type=str, default="data/synthetic_adaptive_real")
+    parser.add_argument("--num_images", type=int, default=6000)
+    parser.add_argument("--similarity", type=float, default=0.8, 
                        help="Порог схожести гистограмм (0.3-0.6 рекомендуется)")
     parser.add_argument("--seed", type=int, default=42)
     
