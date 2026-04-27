@@ -12,6 +12,7 @@ data/severstal/defects_visualization_correct/
 data/severstal/test_images/
 data/severstal/train_images/
 data/
+result_domain_gap/
 
 # Models (обученные модели весят много)
 models/

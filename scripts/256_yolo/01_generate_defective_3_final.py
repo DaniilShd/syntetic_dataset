@@ -224,8 +224,8 @@ class DefectiveGenerator:
         # Генерация
         if self.config.use_ip_adapter:
             output = self.pipe(
-                prompt="steel surface, metal sheet, industrial material",
-                negative_prompt="blurry, low quality, distorted, text, watermark, cartoon, painting",
+                prompt=self.config.prompt,
+                negative_prompt=self.config.negative_prompt,
                 image=reference_image,
                 strength=strength,
                 guidance_scale=self.config.guidance_scale,
@@ -236,8 +236,8 @@ class DefectiveGenerator:
             )
         else:
             output = self.pipe(
-                prompt="steel surface, metal sheet, industrial material",
-                negative_prompt="blurry, low quality, distorted, text, watermark, cartoon, painting",
+                prompt=self.config.prompt,
+                negative_prompt=self.config.negative_prompt,
                 image=reference_image,
                 strength=strength,
                 guidance_scale=self.config.guidance_scale,
@@ -429,7 +429,7 @@ def main():
     # Основные пути
     parser.add_argument("--input_dir", type=str, default="data/256_yolo/balanced_defect_patches/train",
                        help="Директория с изображениями (содержит images/ и labels/)")
-    parser.add_argument("--output_dir", type=str, default="data/dataset_synthetic/defect_patches_v8",
+    parser.add_argument("--output_dir", type=str, default="data/dataset_synthetic/defect_patches_v4",
                        help="Выходная директория")
     
     # Параметры генерации (ОПТИМИЗИРОВАНЫ для сохранения текстуры)
@@ -437,13 +437,13 @@ def main():
                        help="Количество синтетических вариантов на одно изображение")
     parser.add_argument("--limit", type=int, default=None,
                        help="Общий лимит генерируемых изображений")
-    parser.add_argument("--strength_min", type=float, default=0.15,
+    parser.add_argument("--strength_min", type=float, default=0.10,
                        help="Минимальная сила преобразования (меньше = больше сохранения структуры)")
-    parser.add_argument("--strength_max", type=float, default=0.25,
+    parser.add_argument("--strength_max", type=float, default=0.35,
                        help="Максимальная сила преобразования (рекомендуется 0.15-0.25)")
-    parser.add_argument("--guidance_scale", type=float, default=3.0,
+    parser.add_argument("--guidance_scale", type=float, default=6.0,
                        help="Сила следования промпту (меньше = меньше галлюцинаций)")
-    parser.add_argument("--steps", type=int, default=20,
+    parser.add_argument("--steps", type=int, default=40,
                        help="Количество шагов денойзинга (меньше = меньше сглаживания)")
     parser.add_argument("--prompt", type=str, 
                        default="industrial steel surface with manufacturing texture, detailed metallic structure",
@@ -454,7 +454,7 @@ def main():
                        help="Отключить спектральное согласование (FFT matching)")
     parser.add_argument("--no_high_freq", action="store_true",
                        help="Отключить инжекцию высоких частот")
-    parser.add_argument("--high_freq_alpha", type=float, default=0.3,
+    parser.add_argument("--high_freq_alpha", type=float, default=0.5,
                        help="Сила инжекции высоких частот (0.2-0.4 рекомендуется)")
     
     # Аугментация

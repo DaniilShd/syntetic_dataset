@@ -23,9 +23,23 @@ class GenerationConfig:
     device: str = "cuda"
     
     # Промпты
-    prompt: str = "steel surface, metal sheet, industrial material"
-    negative_prompt: str = "text, watermark, logo, rust, defect, crack, hole, object, person"
-    
+    # prompt: str = "steel surface, metal sheet, industrial material"
+    prompt: str = (
+        "industrial steel surface, metallic texture, "
+        "manufacturing grade metal, uniform illumination, "
+        "high quality industrial photography, sharp details"
+    )
+    # negative_prompt="blurry, low quality, distorted, text, watermark, cartoon, painting"
+    negative_prompt: str = (
+        "blurry, low quality, distorted, noise, grain, "
+        "text, watermark, logo, signature, "
+        "rust, corrosion, defect, crack, hole, scratch, "
+        "person, human, face, hand, "
+        "object, tool, equipment, background, "
+        "cartoon, painting, drawing, 3d render, "
+        "overexposed, underexposed, dark, shadow"
+    )
+        
     # Ключевые параметры для Severstal
     ip_adapter_scale_min: float = 0.70
     ip_adapter_scale_max: float = 0.80

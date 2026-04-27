@@ -395,7 +395,7 @@ def main():
     parser.add_argument("--severstal_csv", type=str, default="data/severstal/train.csv")
     parser.add_argument("--output_dir", type=str, default="data/synthetic_adaptive_real")
     parser.add_argument("--num_images", type=int, default=6000)
-    parser.add_argument("--similarity", type=float, default=0.8, 
+    parser.add_argument("--similarity", type=float, default=1.0, 
                        help="Порог схожести гистограмм (0.3-0.6 рекомендуется)")
     parser.add_argument("--seed", type=int, default=42)
     

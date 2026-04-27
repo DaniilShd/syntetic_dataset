@@ -224,8 +224,8 @@ class DefectiveGenerator:
         # Генерация
         if self.config.use_ip_adapter:
             output = self.pipe(
-                prompt="steel surface, metal sheet, industrial material",
-                negative_prompt="blurry, low quality, distorted, text, watermark, cartoon, painting",
+                prompt=self.config.prompt,
+                negative_prompt=self.config.negative_prompt,
                 image=reference_image,
                 strength=strength,
                 guidance_scale=self.config.guidance_scale,
@@ -236,8 +236,8 @@ class DefectiveGenerator:
             )
         else:
             output = self.pipe(
-                prompt="steel surface, metal sheet, industrial material",
-                negative_prompt="blurry, low quality, distorted, text, watermark, cartoon, painting",
+                prompt=self.config.prompt,
+                negative_prompt=self.config.negative_prompt,
                 image=reference_image,
                 strength=strength,
                 guidance_scale=self.config.guidance_scale,
@@ -429,7 +429,7 @@ def main():
     # Основные пути
     parser.add_argument("--input_dir", type=str, default="data/256_yolo/balanced_defect_patches/train",
                        help="Директория с изображениями (содержит images/ и labels/)")
-    parser.add_argument("--output_dir", type=str, default="data/dataset_synthetic/defect_patches_v8",
+    parser.add_argument("--output_dir", type=str, default="data/dataset_synthetic/defect_patches_for_detr",
                        help="Выходная директория")
     
     # Параметры генерации (ОПТИМИЗИРОВАНЫ для сохранения текстуры)

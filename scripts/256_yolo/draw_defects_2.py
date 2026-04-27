@@ -68,7 +68,7 @@ def main():
                        help="Путь к разметке")
     parser.add_argument("--output", type=str, default="data/synthetic_adaptive_real/visualized",
                        help="Выходная директория")
-    parser.add_argument("--samples", type=int, default=200,
+    parser.add_argument("--samples", type=int, default=100,
                        help="Количество случайных примеров (0 = все)")
     parser.add_argument("--show", action="store_true",
                        help="Показать изображения")
