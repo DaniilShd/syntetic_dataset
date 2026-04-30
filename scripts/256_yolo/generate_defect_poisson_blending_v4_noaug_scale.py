@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 generate_defect_poisson_blending.py
-Poisson Blending + Аугментация фона ПЕРЕД вставкой дефекта
+Poisson Blending + Масштабирование + Color Correction
 Основано на: Pérez et al., "Poisson Image Editing", SIGGRAPH 2003
-ИСПРАВЛЕНО: RLE с учётом сдвига патча, все дефекты одновременно
-УЛУЧШЕНО: Снижение domain gap, увеличение разнообразия фонов для DINOv2
+ДОБАВЛЕНО: Color-preserving blend для высоких strength SD (анти-артефакты)
+БЕЗ АУГМЕНТАЦИИ ФОНА
 """
 
 import sys
@@ -17,7 +17,6 @@ import logging
 import traceback
 import pandas as pd
 import numpy as np
-import albumentations as A
 from PIL import Image
 from pathlib import Path
 from tqdm import tqdm
@@ -33,30 +32,138 @@ logger = logging.getLogger(__name__)
 @dataclass
 class PoissonBlendConfig:
     gradient_mixing: float = 0.0
-    sd_strength_min: float = 0.05  # Снижено для естественности 005
-    sd_strength_max: float = 0.12  # Снижено 012
-    sd_steps: int = 20  # Уменьшено для скорости
-    sd_guidance_scale: float = 1.8  # Снижено
+    sd_strength_min: float = 0.05
+    sd_strength_max: float = 0.12
+    sd_steps: int = 20
+    sd_guidance_scale: float = 1.8
     random_seed: int = 42
-    augment_background: bool = True
     use_spectrum_matching: bool = True
     use_high_freq_injection: bool = True
-    high_freq_alpha: float = 0.35  # Снижено
+    high_freq_alpha: float = 0.35
     prompt: str = "metal surface defect, scratch, industrial steel texture, metallic sheen, brushed metal"
-    negative_prompt: str = "smooth, plastic, wood, rust, glass, organic, painted"
-    # Новые параметры для контроля разнообразия
-    metal_texture_aug: bool = True
-    background_variation: float = 0.7
+    negative_prompt: str = "smooth, plastic, wood, rust, glass, organic, painted, colorful, rainbow, vibrant"
+    metal_texture_aug: bool = False
     defect_consistency: float = 0.8
+    scale_factors: List[float] = None
+    # Color correction
+    color_correction_strength: float = 0.85  # Сила цветокоррекции (0.85 = почти полная)
+
+    def __post_init__(self):
+        if self.scale_factors is None:
+            self.scale_factors = [1.0, 1.05, 1.1, 1.15]
+
+
+def color_transfer_lab(source: np.ndarray, target: np.ndarray) -> np.ndarray:
+    """
+    Перенос цвета из source в target в пространстве Lab.
+    Сохраняет текстуру target, но цвета из source.
+    Используется для удаления цветовых артефактов SD.
+    """
+    # Конвертируем в Lab
+    source_lab = cv2.cvtColor(source.astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
+    target_lab = cv2.cvtColor(target.astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
+    
+    # Вычисляем статистики для каждого канала
+    result_lab = target_lab.copy()
+    
+    for channel in range(3):
+        src_mean, src_std = source_lab[:, :, channel].mean(), source_lab[:, :, channel].std()
+        tgt_mean, tgt_std = target_lab[:, :, channel].mean(), target_lab[:, :, channel].std()
+        
+        # Нормализуем и применяем статистики source
+        if tgt_std > 0:
+            result_lab[:, :, channel] = ((target_lab[:, :, channel] - tgt_mean) * (src_std / tgt_std)) + src_mean
+    
+    result_lab = np.clip(result_lab, 0, 255).astype(np.uint8)
+    result_rgb = cv2.cvtColor(result_lab, cv2.COLOR_LAB2RGB)
+    
+    return result_rgb.astype(np.float32)
+
+
+def histogram_matching(source: np.ndarray, target: np.ndarray) -> np.ndarray:
+    """
+    Сопоставление гистограмм: приводит распределение цветов target к source.
+    Работает поканально в RGB.
+    """
+    matched = np.zeros_like(target)
+    
+    for channel in range(3):
+        src_channel = source[:, :, channel].ravel()
+        tgt_channel = target[:, :, channel].ravel()
+        
+        # Вычисляем CDF
+        src_values, src_counts = np.unique(src_channel, return_counts=True)
+        tgt_values, tgt_counts = np.unique(tgt_channel, return_counts=True)
+        
+        src_cdf = np.cumsum(src_counts).astype(np.float64) / src_channel.size
+        tgt_cdf = np.cumsum(tgt_counts).astype(np.float64) / tgt_channel.size
+        
+        # Создаём маппинг
+        interp_values = np.interp(tgt_cdf, src_cdf, src_values)
+        
+        # Применяем маппинг
+        matched_channel = np.interp(tgt_channel, tgt_values, interp_values)
+        matched[:, :, channel] = matched_channel.reshape(target.shape[:2])
+    
+    return matched.astype(np.float32)
+
+
+def adaptive_color_correction(sd_result: np.ndarray, original_bg: np.ndarray,
+                             defect_mask: np.ndarray, strength: float = 0.85) -> np.ndarray:
+    """
+    Адаптивная цветокоррекция SD-результата.
+    
+    Стратегия:
+    1. Для фона (вне маски) - полный color transfer от оригинала
+    2. Для дефекта (внутри маски) - частичный color transfer
+    3. На границе - плавное смешивание
+    
+    Это предотвращает появление цветных пятен от SD.
+    """
+    # Ensure consistent float32 type
+    sd_result = sd_result.astype(np.float32)
+    original_bg = original_bg.astype(np.float32)
+    defect_mask = defect_mask.astype(np.float32)
+    
+    h, w = defect_mask.shape[:2]
+    
+    # Расширяем маску для создания зоны перехода
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    mask_outer = cv2.dilate(defect_mask, kernel)
+    mask_inner = cv2.erode(defect_mask, kernel)
+    
+    # Создаём веса для разных зон
+    transition_zone = mask_outer - mask_inner
+    transition_zone = np.clip(transition_zone, 0, 1)
+    
+    # Размываем для плавности
+    transition_zone = cv2.GaussianBlur(transition_zone, (15, 15), 7)
+    
+    # Цветокоррекция всего изображения
+    corrected_full = color_transfer_lab(original_bg, sd_result)
+    
+    # Частичная коррекция для дефекта (сохраняем 30% оригинальных цветов SD)
+    corrected_defect = cv2.addWeighted(sd_result, 1.0 - strength * 0.3, corrected_full, strength * 0.3, 0)
+    
+    # Веса для смешивания
+    bg_weight = mask_outer * strength
+    defect_weight = mask_inner * (1.0 - strength * 0.3)
+    
+    # Собираем результат
+    result = sd_result.copy()
+    
+    # Применяем коррекцию к фону (расширяем маски до 3 каналов)
+    bg_weight_3ch = np.stack([bg_weight] * 3, axis=-1)
+    defect_weight_3ch = np.stack([defect_weight] * 3, axis=-1)
+    
+    result = corrected_full * bg_weight_3ch + result * (1 - bg_weight_3ch)
+    result = corrected_defect * defect_weight_3ch + result * (1 - defect_weight_3ch)
+    
+    return np.clip(result, 0, 255)
 
 
 def create_blend_mask(component_mask: np.ndarray, crop_h: int, crop_w: int,
                      feather_inner: int = 3, feather_outer: int = 5) -> np.ndarray:
-    """
-    Создаёт маску смешивания с двойным размытием:
-    - Внутренняя область (ближе к центру дефекта) — резкий переход
-    - Внешняя область (граница с фоном) — плавный переход
-    """
     mask_float = component_mask.astype(np.float32)
     
     kernel_outer = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (feather_outer*2+1, feather_outer*2+1))
@@ -76,10 +183,10 @@ def create_blend_mask(component_mask: np.ndarray, crop_h: int, crop_w: int,
 
 def apply_multiscale_blend(defect: np.ndarray, background: np.ndarray,
                           component_mask: np.ndarray) -> np.ndarray:
-    """
-    Многослойное смешивание для сохранения резкости дефекта
-    и плавного перехода на границах.
-    """
+    # Ensure float32
+    defect = defect.astype(np.float32)
+    background = background.astype(np.float32)
+    
     h, w = component_mask.shape
     mask_float = component_mask.astype(np.float32)
     
@@ -117,33 +224,71 @@ def apply_multiscale_blend(defect: np.ndarray, background: np.ndarray,
     
     if transition_zone.max() > 0:
         bg_blur = cv2.GaussianBlur(background, (0, 0), sigmaX=5)
-        bg_details = background.astype(np.float32) - bg_blur.astype(np.float32)
-        # Усилено с 0.2 до 0.3 для лучшей передачи текстуры металла
+        bg_details = background - bg_blur
         result = result + bg_details * transition_zone * 0.3
     
     return np.clip(result, 0, 255).astype(np.uint8)
 
 
-# ================= АУГМЕНТАЦИЯ ФОНА (УЛУЧШЕННАЯ ДЛЯ МЕТАЛЛА) =================
+def scale_defect_and_mask(background_crop: np.ndarray, crop_comp_mask: np.ndarray,
+                         scale_factor: float) -> Tuple[np.ndarray, np.ndarray]:
+    if scale_factor == 1.0:
+        return background_crop, crop_comp_mask
+    
+    h, w = background_crop.shape[:2]
+    
+    moments = cv2.moments(crop_comp_mask)
+    if moments['m00'] == 0:
+        return background_crop, crop_comp_mask
+    
+    cx = int(moments['m10'] / moments['m00'])
+    cy = int(moments['m01'] / moments['m00'])
+    
+    new_w = int(w * scale_factor)
+    new_h = int(h * scale_factor)
+    
+    scaled_bg = cv2.resize(background_crop, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+    scaled_mask = cv2.resize(crop_comp_mask.astype(np.float32), (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    scaled_mask = (scaled_mask > 0.5).astype(np.uint8)
+    
+    new_cx = int(cx * scale_factor)
+    new_cy = int(cy * scale_factor)
+    
+    x_offset = cx - new_cx
+    y_offset = cy - new_cy
+    
+    output_bg = np.zeros_like(background_crop)
+    output_mask = np.zeros_like(crop_comp_mask)
+    
+    src_x1 = max(0, -x_offset)
+    src_y1 = max(0, -y_offset)
+    src_x2 = min(new_w, w - x_offset)
+    src_y2 = min(new_h, h - y_offset)
+    
+    dst_x1 = max(0, x_offset)
+    dst_y1 = max(0, y_offset)
+    dst_x2 = min(w, x_offset + new_w)
+    dst_y2 = min(h, y_offset + new_h)
+    
+    copy_w = min(src_x2 - src_x1, dst_x2 - dst_x1)
+    copy_h = min(src_y2 - src_y1, dst_y2 - dst_y1)
+    
+    if copy_w > 0 and copy_h > 0:
+        output_bg[dst_y1:dst_y1+copy_h, dst_x1:dst_x1+copy_w] = \
+            scaled_bg[src_y1:src_y1+copy_h, src_x1:src_x1+copy_w]
+        output_mask[dst_y1:dst_y1+copy_h, dst_x1:dst_x1+copy_w] = \
+            scaled_mask[src_y1:src_y1+copy_h, src_x1:src_x1+copy_w]
+    
+    # Заполняем пустые области оригинальным фоном
+    empty_mask = (output_bg.sum(axis=2) == 0) if len(output_bg.shape) == 3 else (output_bg == 0)
+    if len(output_bg.shape) == 3:
+        empty_mask_3ch = np.stack([empty_mask] * 3, axis=-1)
+        output_bg[empty_mask_3ch] = background_crop[empty_mask_3ch]
+    
+    return output_bg, output_mask
 
-def get_background_augmentation() -> A.Compose:
-    """Аугментации фона без прямоугольных артефактов"""
-    return A.Compose([
-        A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.18, p=0.8),
-        A.HueSaturationValue(hue_shift_limit=8, sat_shift_limit=15, val_shift_limit=12, p=0.5),
-        A.ChannelShuffle(p=0.3),
-        # Вместо CoarseDropout — пиксельный шум + лёгкое размытие
-        A.GaussNoise(std_range=(0.01, 0.04), p=0.4),
-        A.MotionBlur(blur_limit=3, p=0.15),
-        A.MedianBlur(blur_limit=3, p=0.15),
-        A.ImageCompression(quality_range=(85, 95), p=0.3),
-        # Текстурные вариации без прямоугольников
-        A.CLAHE(clip_limit=1.5, tile_grid_size=(8, 8), p=0.3),
-        A.RandomGamma(gamma_limit=(90, 110), p=0.3)
-    ])
 
-
-# ================= RLE С УЧЁТОМ СДВИГА ПАТЧА =================
+# ================= RLE =================
 
 def parse_patch_offset(filename: str) -> Tuple[int, int]:
     match = re.search(r'_x(\d+)_w(\d+)', filename)
@@ -250,115 +395,7 @@ def inject_high_freq(source: np.ndarray, target: np.ndarray, alpha: float = 0.4)
     return np.clip(result, 0, 255).astype(np.uint8)
 
 
-# ================= POISSON BLENDING =================
-
-def compute_guidance_field(defect_patch: np.ndarray, background_patch: np.ndarray,
-                          mask: np.ndarray, mix: float = 0.0) -> Tuple[np.ndarray, np.ndarray]:
-    grad_defect_y, grad_defect_x = np.gradient(defect_patch.astype(np.float64))
-    grad_bg_y, grad_bg_x = np.gradient(background_patch.astype(np.float64))
-    
-    mag_defect = np.sqrt(grad_defect_y**2 + grad_defect_x**2)
-    mag_bg = np.sqrt(grad_bg_y**2 + grad_bg_x**2)
-    
-    use_defect = mag_defect > mag_bg
-    vy = np.where(use_defect, grad_defect_y, grad_bg_y)
-    vx = np.where(use_defect, grad_defect_x, grad_bg_x)
-    
-    if mix > 0:
-        vy = (1 - mix) * vy + mix * grad_bg_y
-        vx = (1 - mix) * vx + mix * grad_bg_x
-    
-    return vy, vx
-
-
-def solve_poisson_sparse(background: np.ndarray, guidance_vy: np.ndarray,
-                         guidance_vx: np.ndarray, mask: np.ndarray,
-                         boundary_mask: np.ndarray) -> np.ndarray:
-    h, w = mask.shape
-    div_v = np.gradient(guidance_vy, axis=0) + np.gradient(guidance_vx, axis=1)
-    
-    solve_mask = (mask > 0) & (boundary_mask == 0)
-    solve_indices = np.where(solve_mask.ravel() > 0)[0]
-    n = len(solve_indices)
-    
-    if n == 0:
-        return background.copy()
-    
-    flat_to_matrix = {flat_idx: i for i, flat_idx in enumerate(solve_indices)}
-    A = lil_matrix((n, n), dtype=np.float64)
-    b = np.zeros(n, dtype=np.float64)
-    div_flat = div_v.ravel()
-    bg_flat = background.ravel()
-    
-    for i, flat_idx in enumerate(solve_indices):
-        y, x = divmod(flat_idx, w)
-        A[i, i] = -4
-        b[i] = div_flat[flat_idx]
-        
-        for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-            ny, nx = y + dy, x + dx
-            if 0 <= ny < h and 0 <= nx < w:
-                neighbor_flat = ny * w + nx
-                if solve_mask.ravel()[neighbor_flat]:
-                    A[i, flat_to_matrix[neighbor_flat]] = 1
-                else:
-                    b[i] -= bg_flat[neighbor_flat]
-    
-    try:
-        x = spsolve(csr_matrix(A), b)
-    except Exception as e:
-        logger.warning(f"Sparse solve failed: {e}")
-        return background.copy()
-    
-    result = background.copy().astype(np.float64)
-    result_flat = result.ravel()
-    result_flat[solve_indices] = np.clip(x, 0, 255)
-    
-    boundary_indices = np.where((boundary_mask > 0).ravel())[0]
-    result_flat[boundary_indices] = bg_flat[boundary_indices]
-    
-    return result.reshape(h, w)
-
-
-def poisson_blend_single_channel(background: np.ndarray, defect: np.ndarray,
-                                 mask: np.ndarray, boundary_mask: np.ndarray,
-                                 mix: float = 0.0) -> np.ndarray:
-    mask_area = mask.sum()
-    boundary_area = boundary_mask.sum()
-    
-    if mask_area == 0:
-        return background
-    
-    if boundary_area >= mask_area * 0.5:
-        vy, vx = compute_guidance_field(defect, background, mask, mix=0.3)
-    else:
-        vy, vx = compute_guidance_field(defect, background, mask, mix)
-    
-    result = solve_poisson_sparse(background, vy, vx, mask, boundary_mask)
-    
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    mask_eroded = cv2.erode(mask.astype(np.uint8), kernel, iterations=1)
-    mask_eroded_float = mask_eroded.astype(np.float32)
-    
-    center_zone = cv2.GaussianBlur(mask_eroded_float, (3, 3), 1)
-    result = result * (1 - center_zone * 0.3) + defect * (center_zone * 0.3)
-    
-    return np.clip(result, 0, 255).astype(np.uint8)
-
-
-def poisson_blend_color(background: np.ndarray, defect: np.ndarray,
-                       mask: np.ndarray, boundary_mask: np.ndarray,
-                       config: PoissonBlendConfig) -> np.ndarray:
-    result = np.zeros_like(background)
-    for channel in range(3):
-        result[:, :, channel] = poisson_blend_single_channel(
-            background[:, :, channel].astype(np.float64),
-            defect[:, :, channel].astype(np.float64),
-            mask, boundary_mask, config.gradient_mixing)
-    return result
-
-
-# ================= SD ГЕНЕРАЦИЯ (УЛУЧШЕННАЯ) =================
+# ================= SD ГЕНЕРАЦИЯ =================
 
 class SDDefectGenerator:
     def __init__(self, config: PoissonBlendConfig, device: str = "cuda"):
@@ -373,7 +410,7 @@ class SDDefectGenerator:
         
         torch_dtype = torch.float16 if device == "cuda" else torch.float32
         
-        logger.info("🔄 Загрузка Stable Diffusion...")
+        logger.info("Загрузка Stable Diffusion...")
         self.pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
             "runwayml/stable-diffusion-v1-5",
             torch_dtype=torch_dtype,
@@ -386,22 +423,16 @@ class SDDefectGenerator:
         if device == "cuda":
             if hasattr(self.pipe, 'enable_attention_slicing'):
                 self.pipe.enable_attention_slicing()
-                logger.info("  ✓ attention slicing включен")
-            
             if hasattr(self.pipe, 'enable_vae_slicing'):
                 self.pipe.enable_vae_slicing()
-                logger.info("  ✓ VAE slicing включен")
             elif hasattr(self.pipe, 'enable_vae_tiling'):
                 self.pipe.enable_vae_tiling()
-                logger.info("  ✓ VAE tiling включен")
-            
             try:
                 self.pipe.enable_model_cpu_offload()
-                logger.info("  ✓ model CPU offload включен")
             except:
                 pass
         
-        logger.info("🚀 SD готов")
+        logger.info("SD готов")
     
     @torch.no_grad()
     def generate(self, defect_crop: Image.Image, seed: int = None) -> np.ndarray:
@@ -418,7 +449,6 @@ class SDDefectGenerator:
         generator = torch.Generator(device=self.device).manual_seed(seed)
         strength = random.uniform(self.config.sd_strength_min, self.config.sd_strength_max)
         
-        # Случайный пропуск SD для сохранения структуры дефекта
         if random.random() > self.config.defect_consistency:
             return np.array(defect_crop).astype(np.float32)
         
@@ -441,6 +471,14 @@ class SDDefectGenerator:
             generated_np = np.array(generated).astype(np.float32)
             crop_np = np.array(defect_crop).astype(np.float32)
             
+            # Color correction для удаления цветовых артефактов
+            if self.config.color_correction_strength > 0:
+                generated_np = adaptive_color_correction(
+                    generated_np, crop_np,
+                    np.ones((h, w), dtype=np.float32),  # Вся область
+                    self.config.color_correction_strength
+                )
+            
             if self.config.use_spectrum_matching:
                 generated_np = match_spectrum(generated_np, crop_np)
             
@@ -461,31 +499,22 @@ class PoissonDefectGenerator:
         self.config = config or PoissonBlendConfig()
         
         logger.info("Инициализация PoissonDefectGenerator...")
+        logger.info(f"Масштабирование: {self.config.scale_factors}")
+        logger.info(f"Color correction strength: {self.config.color_correction_strength}")
+        logger.info("Аугментация фона: ОТКЛЮЧЕНА")
+        
         try:
             self.sd_generator = SDDefectGenerator(self.config)
-            logger.info("✓ SD генератор успешно загружен")
+            logger.info("SD генератор успешно загружен")
         except Exception as e:
-            logger.error(f"❌ Ошибка загрузки SD генератора: {e}")
+            logger.error(f"Ошибка загрузки SD генератора: {e}")
             self.sd_generator = None
             raise
-        
-        self.bg_augmenter = get_background_augmentation() if self.config.augment_background else None
         
         random.seed(self.config.random_seed)
         np.random.seed(self.config.random_seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(self.config.random_seed)
-    
-    def augment_background(self, image: np.ndarray) -> np.ndarray:
-        """Аугментирует фон с контролем вариативности для предотвращения переобучения"""
-        if self.bg_augmenter is None:
-            return image
-        # Вариативное применение аугментаций
-        if random.random() < self.config.background_variation:
-            augmented = self.bg_augmenter(image=image)
-            return augmented['image']
-        else:
-            return image
     
     def process_image_all_defects(self, img_path: Path, all_bboxes: List[Dict],
                                   output_dir: Path, variant: int, total_idx: int) -> Optional[Dict]:
@@ -502,13 +531,8 @@ class PoissonDefectGenerator:
             original = cv2.cvtColor(original, cv2.COLOR_BGR2RGB)
             img_h, img_w = original.shape[:2]
             
-            # Дополнительная аугментация текстуры металла
-            if self.config.metal_texture_aug and random.random() < 0.5:
-                blur = cv2.GaussianBlur(original, (0, 0), sigmaX=1.0)
-                enhanced = cv2.addWeighted(original, 1.2, blur, -0.2, 0)
-                background = np.clip(enhanced, 0, 255).astype(np.uint8)
-            else:
-                background = self.augment_background(original)
+            # Используем оригинальное изображение без аугментации
+            background = original.copy()
             
             result = background.copy().astype(np.float32)
             yolo_annotations = []
@@ -542,8 +566,14 @@ class PoissonDefectGenerator:
                 
                 background_crop = background[y1:y2, x1:x2].copy()
                 
+                # Масштабирование
+                scale_factor = random.choice(self.config.scale_factors)
+                scaled_bg_crop, scaled_comp_mask = scale_defect_and_mask(
+                    background_crop, crop_comp_mask, scale_factor
+                )
+                
                 background_crop_pil = Image.fromarray(
-                    np.clip(background_crop, 0, 255).astype(np.uint8)
+                    np.clip(scaled_bg_crop, 0, 255).astype(np.uint8)
                 )
                 
                 seed = self.config.random_seed + total_idx * 100 + variant * 10 + bbox_idx
@@ -560,10 +590,19 @@ class PoissonDefectGenerator:
                         interpolation=cv2.INTER_LANCZOS4
                     )
                 
+                # Дополнительная цветокоррекция на уровне кропа (только для фона)
+                if self.config.color_correction_strength > 0:
+                    generated_np = adaptive_color_correction(
+                        generated_np,
+                        background_crop.astype(np.float32),
+                        scaled_comp_mask.astype(np.float32),
+                        self.config.color_correction_strength
+                    )
+                
                 blended = apply_multiscale_blend(
                     generated_np,
                     background_crop.astype(np.float32),
-                    crop_comp_mask
+                    scaled_comp_mask
                 )
                 
                 if blended.shape[:2] != (crop_h, crop_w):
@@ -587,8 +626,9 @@ class PoissonDefectGenerator:
             
             result_uint8 = np.clip(result, 0, 255).astype(np.uint8)
             
-            blur = cv2.GaussianBlur(result_uint8, (0, 0), sigmaX=1.5)
-            result_uint8 = cv2.addWeighted(result_uint8, 1.3, blur, -0.3, 0)
+            # Финальное улучшение без аугментации
+            blur = cv2.GaussianBlur(result_uint8, (0, 0), sigmaX=0.5)
+            result_uint8 = cv2.addWeighted(result_uint8, 1.1, blur, -0.1, 0)
             result_uint8 = np.clip(result_uint8, 0, 255).astype(np.uint8)
             
             result_bgr = cv2.cvtColor(result_uint8, cv2.COLOR_RGB2BGR)
@@ -608,7 +648,7 @@ class PoissonDefectGenerator:
             return {"filename": filename, "num_defects": len(yolo_annotations)}
         
         except Exception as e:
-            logger.error(f"❌ Error processing {img_path.name}: {e}")
+            logger.error(f"Error processing {img_path.name}: {e}")
             traceback.print_exc()
             return None
     
@@ -621,8 +661,8 @@ class PoissonDefectGenerator:
         rle_df = pd.read_csv(rle_csv)
         groups = rle_df.groupby('ImageId')
         
-        logger.info(f"📂 Найдено патчей: {len(groups)}")
-        logger.info(f"   С несколькими дефектами: {(groups.size() > 1).sum()}")
+        logger.info(f"Найдено патчей: {len(groups)}")
+        logger.info(f"  С несколькими дефектами: {(groups.size() > 1).sum()}")
         
         all_images = {}
         for ext in ['*.png', '*.jpg', '*.jpeg']:
@@ -632,7 +672,7 @@ class PoissonDefectGenerator:
         
         stats = {'total': 0, 'errors': 0, 'defects': 0}
         
-        for image_id, group in tqdm(groups, desc="Poisson + Aug"):
+        for image_id, group in tqdm(groups, desc="Poisson + Scale + CC (No Aug)"):
             if limit and stats['total'] >= limit:
                 break
             
@@ -670,7 +710,7 @@ class PoissonDefectGenerator:
                 if stats['total'] % 10 == 0 and torch.cuda.is_available():
                     torch.cuda.empty_cache()
         
-        logger.info(f"✅ Итого: {stats['total']} изображений, "
+        logger.info(f"Итого: {stats['total']} изображений, "
                    f"{stats['defects']} дефектов, {stats['errors']} ошибок")
         return stats['total']
 
@@ -679,35 +719,27 @@ class PoissonDefectGenerator:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Poisson Blending + Background Augmentation (исправленный RLE)"
+        description="Poisson Blending + Scale + Color Correction (Без аугментации фона)"
     )
-    parser.add_argument("--input_dir", type=str, required=True,
-                       help="Директория с исходными изображениями")
-    parser.add_argument("--rle_csv", type=str, required=True,
-                       help="CSV-файл с RLE-разметкой")
-    parser.add_argument("--output_dir", type=str, required=True,
-                       help="Директория для сохранения результатов")
-    parser.add_argument("--variants", type=int, default=3,
-                       help="Количество вариантов на изображение")
-    parser.add_argument("--limit", type=int, default=None,
-                       help="Ограничение количества генерируемых изображений")
-    parser.add_argument("--sd_strength", type=float, default=None,
-                       help="Фиксированная strength для SD")
-    parser.add_argument("--sd_strength_min", type=float, default=0.05) #0.10
-    parser.add_argument("--sd_strength_max", type=float, default=0.12) #0.20
+    parser.add_argument("--input_dir", type=str, required=True)
+    parser.add_argument("--rle_csv", type=str, required=True)
+    parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--variants", type=int, default=3)
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--sd_strength", type=float, default=None)
+    parser.add_argument("--sd_strength_min", type=float, default=0.10)
+    parser.add_argument("--sd_strength_max", type=float, default=0.20)
     parser.add_argument("--sd_steps", type=int, default=20)
     parser.add_argument("--guidance_scale", type=float, default=1.8)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--no_augment", action="store_true",
-                       help="Отключить аугментацию фона")
-    parser.add_argument("--no_spectrum", action="store_true",
-                       help="Отключить spectrum matching")
-    parser.add_argument("--no_high_freq", action="store_true",
-                       help="Отключить high frequency injection")
+    parser.add_argument("--no_spectrum", action="store_true")
+    parser.add_argument("--no_high_freq", action="store_true")
+    parser.add_argument("--color_correction", type=float, default=0.85,
+                       help="Сила цветокоррекции (0 - без коррекции, 1 - полная)")
     parser.add_argument("--prompt", type=str,
                        default="metal surface defect, scratch, industrial steel texture, metallic sheen, brushed metal")
     parser.add_argument("--negative_prompt", type=str,
-                       default="smooth, plastic, wood, rust, glass, organic, painted")
+                       default="smooth, plastic, wood, rust, glass, organic, painted, colorful, rainbow, vibrant")
     
     args = parser.parse_args()
     
@@ -715,11 +747,12 @@ def main():
         random_seed=args.seed,
         sd_steps=args.sd_steps,
         sd_guidance_scale=args.guidance_scale,
-        augment_background=not args.no_augment,
         use_spectrum_matching=not args.no_spectrum,
         use_high_freq_injection=not args.no_high_freq,
+        color_correction_strength=args.color_correction,
         prompt=args.prompt,
-        negative_prompt=args.negative_prompt
+        negative_prompt=args.negative_prompt,
+        metal_texture_aug=False  # Отключаем аугментацию металла
     )
     
     if args.sd_strength:
@@ -737,7 +770,7 @@ def main():
         args.limit
     )
     
-    logger.info(f"✅ Готово! Сгенерировано {total} изображений")
+    logger.info(f"Готово! Сгенерировано {total} изображений")
 
 
 if __name__ == "__main__":
