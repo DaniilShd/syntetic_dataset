@@ -665,7 +665,12 @@ class PoissonDefectGenerator:
                 if generated_np.shape[:2] != (crop_h, crop_w):
                     generated_np = cv2.resize(generated_np, (crop_w, crop_h), interpolation=cv2.INTER_LANCZOS4)
                 background_crop = background[y1:y2, x1:x2].copy()
-                blended = apply_adaptive_blend(generated_np, background_crop.astype(np.float32), crop_comp_mask)
+                # Простое альфа-смешивание без адаптации
+                mask_float = crop_comp_mask.astype(np.float32)
+                mask_float = cv2.GaussianBlur(mask_float, (15, 15), 7)
+                mask_3ch = np.stack([mask_float] * 3, axis=-1)
+                blended = generated_np * mask_3ch + background_crop.astype(np.float32) * (1 - mask_3ch)
+                blended = np.clip(blended, 0, 255).astype(np.uint8)
                 if blended.shape[:2] != (crop_h, crop_w):
                     blended = cv2.resize(blended, (crop_w, crop_h))
                 result[y1:y2, x1:x2] = blended.astype(np.float32)
